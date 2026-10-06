@@ -1806,4 +1806,113 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
     );
   });
+  it.effect(
+    "preserves inherited fast service when overriding effort and allows clearing options",
+    () =>
+      Effect.gen(function* () {
+        const peerId = ProviderInstanceId.make("codex-subscription-2");
+        const driver = ProviderDriverKind.make("codex");
+        const inherited = {
+          instanceId: codexInstanceId,
+          model: "gpt-5.4",
+          options: [
+            { id: "reasoningEffort", value: "high" },
+            { id: "serviceTier", value: "priority" },
+          ],
+        } as const;
+        const cases = [
+          {
+            name: "partial override",
+            target: { options: [{ id: "reasoningEffort", value: "max" }] },
+            expected: {
+              ...inherited,
+              options: [
+                { id: "reasoningEffort", value: "max" },
+                { id: "serviceTier", value: "priority" },
+              ],
+            },
+          },
+          {
+            name: "clear overrides",
+            target: { options: [] },
+            expected: { instanceId: codexInstanceId, model: "gpt-5.4", options: [] },
+          },
+        ] as const;
+        for (const testCase of cases) {
+          const commands: Array<unknown> = [];
+          const task = {
+            id: taskId,
+            threadId: parentThreadId,
+            runId: parentRunId,
+            parentNodeId,
+            origin: "app_owned",
+            createdBy: "agent",
+            driver,
+            providerInstanceId: peerId,
+            childThreadId,
+            model: "gpt-5.4",
+            status: "running",
+            result: null,
+          };
+          const providers = [
+            {
+              ...providerSnapshot({ instanceId: codexInstanceId, driver, model: "gpt-5.4" }),
+              displayName: "First subscription",
+            },
+            {
+              ...providerSnapshot({ instanceId: peerId, driver, model: "gpt-5.4" }),
+              displayName: "Second subscription",
+            },
+          ];
+          const dependencies = Layer.mergeAll(
+            NodeServices.layer,
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              getThreadRecords: (threadId) =>
+                Effect.succeed(
+                  threadId === parentThreadId
+                    ? parentProjection(commands.length > 0 ? [task] : [], inherited)
+                    : {
+                        ...childProjection,
+                        thread: { ...childProjection.thread, modelSelection: inherited },
+                      },
+                ),
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  commands.push(command);
+                  return {
+                    sequence: 1,
+                    storedEvents: [
+                      {
+                        sequence: 1,
+                        commandId: null,
+                        event: { type: "subagent.updated", payload: task },
+                      },
+                    ],
+                  } as never;
+                }),
+            }),
+            providerRegistryLayer(providers),
+            adapterRegistryLayer([codexInstanceId, peerId]),
+            Layer.mock(ProjectService.ProjectService)({}),
+            Layer.mock(SecretRequests.SecretRequests)({}),
+            Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+          );
+          yield* Effect.gen(function* () {
+            const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+            const delegation = service.delegateTask(scope, {
+              task: "Review the change.",
+              target: testCase.target,
+              mode: "async",
+              clientRequestId: testCase.name,
+            });
+            yield* delegation;
+            assert.deepEqual(
+              (commands[0] as { modelSelection: unknown }).modelSelection,
+              testCase.expected,
+              testCase.name,
+            );
+          }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+        }
+      }),
+  );
 });

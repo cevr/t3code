@@ -1168,15 +1168,25 @@ const make = Effect.gen(function* () {
         }
       }
 
+      const inheritsOptions =
+        instanceId === inheritedSelection.instanceId && model === inheritedSelection.model;
+      const options =
+        requestedOptions === undefined
+          ? inheritsOptions
+            ? inheritedSelection.options
+            : undefined
+          : requestedOptions.length === 0 || !inheritsOptions
+            ? requestedOptions
+            : [
+                ...new Map(
+                  [...(inheritedSelection.options ?? []), ...requestedOptions].map((selection) => [
+                    selection.id,
+                    selection,
+                  ]),
+                ).values(),
+              ];
       return {
-        modelSelection:
-          instanceId === inheritedSelection.instanceId &&
-          model === inheritedSelection.model &&
-          requestedOptions === undefined
-            ? inheritedSelection
-            : requestedOptions === undefined
-              ? { instanceId, model }
-              : { instanceId, model, options: requestedOptions },
+        modelSelection: { instanceId, model, ...(options === undefined ? {} : { options }) },
       };
     });
 
@@ -1292,6 +1302,7 @@ const make = Effect.gen(function* () {
         hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
         providerInstanceId: task.providerInstanceId,
         model: task.model,
+        options: (childRun?.modelSelection ?? childControls.thread.modelSelection)?.options ?? [],
         summary: derivedResult,
         resultContextTransferId: resultTransfer?.id ?? null,
         latestTerminalRunId: terminalRun?.id ?? null,
@@ -1752,6 +1763,7 @@ const make = Effect.gen(function* () {
           parentThreadId: parent?.thread.id ?? null,
           inheritedProviderInstanceId: parent?.thread.modelSelection.instanceId ?? null,
           inheritedModel: parent?.thread.modelSelection.model ?? null,
+          inheritedOptions: parent?.thread.modelSelection.options ?? [],
           runtimeMode: limits.runtimeMode,
           interactionMode: limits.interactionMode,
           providers: providers.map((provider) => {
