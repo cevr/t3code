@@ -13,6 +13,7 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 
@@ -1089,6 +1090,7 @@ describe("OrchestratorMcpService provider resolution", () => {
     "inherits an available parent instance for driver-only targets and otherwise selects a healthy peer",
     () =>
       Effect.gen(function* () {
+        yield* TestClock.setTime(Date.UTC(2026, 9, 6));
         const codexAltInstanceId = ProviderInstanceId.make("codex-alt");
         const driver = ProviderDriverKind.make("codex");
         const claudeDriver = ProviderDriverKind.make("claudeAgent");
@@ -1151,6 +1153,58 @@ describe("OrchestratorMcpService provider resolution", () => {
             candidateDriver: claudeDriver,
           },
           {
+            name: "quota-inherited-selects-peer",
+            inheritedEnabled: true,
+            peerEnabled: true,
+            explicit: false,
+            selectedInstanceId: codexAltInstanceId,
+            candidateDriver: driver,
+            inheritedLimited: true,
+            targetOmitted: true,
+            peerModel: "gpt-5.4",
+          },
+          {
+            name: "quota-explicit-remains-strict",
+            inheritedEnabled: true,
+            peerEnabled: true,
+            explicit: true,
+            selectedInstanceId: null,
+            candidateDriver: driver,
+            inheritedLimited: true,
+          },
+          {
+            name: "quota-peer-missing-model",
+            inheritedEnabled: true,
+            peerEnabled: true,
+            explicit: false,
+            selectedInstanceId: null,
+            candidateDriver: driver,
+            inheritedLimited: true,
+            targetOmitted: true,
+          },
+          {
+            name: "quota-peers-exhausted",
+            inheritedEnabled: true,
+            peerEnabled: true,
+            explicit: false,
+            selectedInstanceId: null,
+            candidateDriver: driver,
+            inheritedLimited: true,
+            peerLimited: true,
+            targetOmitted: true,
+            peerModel: "gpt-5.4",
+          },
+          {
+            name: "quota-already-reset",
+            inheritedEnabled: true,
+            peerEnabled: true,
+            explicit: false,
+            selectedInstanceId: codexInstanceId,
+            candidateDriver: driver,
+            inheritedLimited: true,
+            quotaReset: "2000-01-01T00:00:00.000Z",
+          },
+          {
             name: "explicit-unavailable",
             inheritedEnabled: false,
             peerEnabled: true,
@@ -1200,18 +1254,57 @@ describe("OrchestratorMcpService provider resolution", () => {
                 ),
             }),
             providerRegistryLayer([
-              providerSnapshot({
-                instanceId: codexInstanceId,
-                driver,
-                model: "gpt-5.4",
-                enabled: testCase.inheritedEnabled,
-              }),
-              providerSnapshot({
-                instanceId: codexAltInstanceId,
-                driver: testCase.candidateDriver,
-                model: "codex-alt-model",
-                enabled: testCase.peerEnabled,
-              }),
+              {
+                ...providerSnapshot({
+                  instanceId: codexInstanceId,
+                  driver,
+                  model: "gpt-5.4",
+                  enabled: testCase.inheritedEnabled,
+                }),
+                ...("inheritedLimited" in testCase
+                  ? {
+                      usageLimits: {
+                        checkedAt: "2026-09-13T00:00:00.000Z",
+                        windows: [
+                          {
+                            id: "primary",
+                            kind: "session" as const,
+                            label: "Session",
+                            usedPercent: 100,
+                            resetsAt:
+                              "quotaReset" in testCase
+                                ? testCase.quotaReset
+                                : "2099-01-01T00:00:00.000Z",
+                          },
+                        ],
+                      },
+                    }
+                  : {}),
+              },
+              {
+                ...providerSnapshot({
+                  instanceId: codexAltInstanceId,
+                  driver: testCase.candidateDriver,
+                  model: "peerModel" in testCase ? testCase.peerModel : "codex-alt-model",
+                  enabled: testCase.peerEnabled,
+                }),
+                ...("peerLimited" in testCase
+                  ? {
+                      usageLimits: {
+                        checkedAt: "2026-10-06T00:00:00.000Z",
+                        windows: [
+                          {
+                            id: "five_hour",
+                            kind: "session" as const,
+                            label: "Five hour",
+                            usedPercent: 100,
+                            resetsAt: "2099-01-01T00:00:00.000Z",
+                          },
+                        ],
+                      },
+                    }
+                  : {}),
+              },
             ]),
             adapterRegistryLayer([codexInstanceId, codexAltInstanceId]),
             Layer.mock(ProjectService.ProjectService)({}),
@@ -1221,14 +1314,17 @@ describe("OrchestratorMcpService provider resolution", () => {
 
           yield* Effect.gen(function* () {
             const service = yield* OrchestratorMcpService.OrchestratorMcpService;
-            const target = testCase.explicit
-              ? ({
-                  providerInstanceId:
-                    testCase.selectedInstanceId === null
-                      ? codexInstanceId
-                      : testCase.selectedInstanceId,
-                } as const)
-              : ({ driverKind: testCase.candidateDriver } as const);
+            const target =
+              "targetOmitted" in testCase
+                ? undefined
+                : testCase.explicit
+                  ? ({
+                      providerInstanceId:
+                        testCase.selectedInstanceId === null
+                          ? codexInstanceId
+                          : testCase.selectedInstanceId,
+                    } as const)
+                  : ({ driverKind: testCase.candidateDriver } as const);
             if (testCase.selectedInstanceId === null) {
               const error = yield* service
                 .delegateTask(scope, {
@@ -1283,8 +1379,14 @@ describe("OrchestratorMcpService provider resolution", () => {
               testCase.selectedInstanceId,
               testCase.name,
             );
-            if (testCase.name === "healthy-inherited") {
+            if (testCase.selectedInstanceId === codexInstanceId) {
               assert.deepEqual(request.modelSelection, parentModelSelection, testCase.name);
+            } else if (testCase.name === "quota-inherited-selects-peer") {
+              assert.deepEqual(
+                request.modelSelection,
+                { ...parentModelSelection, instanceId: codexAltInstanceId },
+                testCase.name,
+              );
             } else {
               assert.equal(request.modelSelection.model, "codex-alt-model", testCase.name);
             }
@@ -1293,5 +1395,128 @@ describe("OrchestratorMcpService provider resolution", () => {
           );
         }
       }),
+  );
+  it.effect("selects named subscriptions and rejects ambiguous or conflicting names", () =>
+    Effect.gen(function* () {
+      const peerId = ProviderInstanceId.make("codex-subscription-2");
+      const driver = ProviderDriverKind.make("codex");
+      const inherited = {
+        instanceId: codexInstanceId,
+        model: "gpt-5.4",
+        options: [
+          { id: "reasoningEffort", value: "high" },
+          { id: "serviceTier", value: "priority" },
+        ],
+      } as const;
+      const cases = [
+        {
+          name: "named peer",
+          target: { providerName: "Second subscription" },
+          expected: { instanceId: peerId, model: "gpt-5.4" },
+        },
+        {
+          name: "case insensitive name",
+          target: { providerName: "second SUBSCRIPTION" },
+          expected: { instanceId: peerId, model: "gpt-5.4" },
+        },
+        {
+          name: "unknown name",
+          target: { providerName: "Missing subscription" },
+          error: "provider_unavailable",
+        },
+        {
+          name: "duplicate name",
+          target: { providerName: "First subscription" },
+          duplicate: true,
+          error: "invalid_request",
+        },
+        {
+          name: "conflicting selectors",
+          target: { providerName: "Second subscription", providerInstanceId: codexInstanceId },
+          error: "invalid_request",
+        },
+      ] as const;
+      for (const testCase of cases) {
+        const commands: Array<unknown> = [];
+        const task = {
+          id: taskId,
+          threadId: parentThreadId,
+          runId: parentRunId,
+          parentNodeId,
+          origin: "app_owned",
+          createdBy: "agent",
+          driver,
+          providerInstanceId: peerId,
+          childThreadId,
+          model: "gpt-5.4",
+          status: "running",
+          result: null,
+        };
+        const providers = [
+          {
+            ...providerSnapshot({ instanceId: codexInstanceId, driver, model: "gpt-5.4" }),
+            displayName: "First subscription",
+          },
+          {
+            ...providerSnapshot({ instanceId: peerId, driver, model: "gpt-5.4" }),
+            displayName: "duplicate" in testCase ? "First subscription" : "Second subscription",
+          },
+        ];
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: (threadId) =>
+              Effect.succeed(
+                threadId === parentThreadId
+                  ? parentProjection(commands.length > 0 ? [task] : [], inherited)
+                  : {
+                      ...childProjection,
+                      thread: { ...childProjection.thread, modelSelection: inherited },
+                    },
+              ),
+            dispatch: (command) =>
+              Effect.sync(() => {
+                commands.push(command);
+                return {
+                  sequence: 1,
+                  storedEvents: [
+                    {
+                      sequence: 1,
+                      commandId: null,
+                      event: { type: "subagent.updated", payload: task },
+                    },
+                  ],
+                } as never;
+              }),
+          }),
+          providerRegistryLayer(providers),
+          adapterRegistryLayer([codexInstanceId, peerId]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const delegation = service.delegateTask(scope, {
+            task: "Review the change.",
+            target: testCase.target,
+            mode: "async",
+            clientRequestId: testCase.name,
+          });
+          if ("error" in testCase) {
+            const error = yield* delegation.pipe(Effect.flip);
+            assert.equal(error.code, testCase.error, testCase.name);
+            assert.equal(commands.length, 0, testCase.name);
+          } else {
+            yield* delegation;
+            assert.deepEqual(
+              (commands[0] as { modelSelection: unknown }).modelSelection,
+              testCase.expected,
+              testCase.name,
+            );
+          }
+        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+      }
+    }),
   );
 });

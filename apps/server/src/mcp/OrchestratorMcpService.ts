@@ -51,6 +51,7 @@ import {
   type ProviderInteractionMode,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
+  type ServerProviderUsageWindow,
   type RuntimeMode,
   type ScheduledTask,
   type ScheduledTaskUpsertInput,
@@ -244,9 +245,27 @@ function scheduledTaskSummary(task: ScheduledTask): OrchestratorMcpScheduledTask
   };
 }
 
+function exhaustedUsageWindows(
+  provider: ServerProvider,
+  model: string | undefined,
+  nowMs: number,
+): ReadonlyArray<ServerProviderUsageWindow> {
+  return (provider.usageLimits?.windows ?? []).filter((window) => {
+    if (window.usedPercent < 100) return false;
+    if (window.resetsAt !== undefined && Date.parse(window.resetsAt) <= nowMs) return false;
+    // Claude publishes model-family buckets beside its account-wide windows.
+    const family =
+      provider.driver === "claudeAgent"
+        ? /^seven_day_(opus|sonnet|fable|haiku)$/.exec(window.id)?.[1]
+        : undefined;
+    return family === undefined || (model !== undefined && model.startsWith(`claude-${family}-`));
+  });
+}
+
 function providerConstraints(
   provider: ServerProvider | undefined,
   supportsOrchestrationV2: boolean,
+  quota?: { readonly model?: string | undefined; readonly nowMs: number },
 ): ReadonlyArray<string> {
   const constraints: Array<string> = [];
   if (!supportsOrchestrationV2) {
@@ -263,6 +282,13 @@ function providerConstraints(
   }
   if (provider.auth.status === "unauthenticated") {
     constraints.push("Provider is not authenticated.");
+  }
+  if (quota !== undefined) {
+    for (const window of exhaustedUsageWindows(provider, quota.model, quota.nowMs)) {
+      constraints.push(
+        `Subscription usage limit reached: ${window.label}${window.resetsAt === undefined ? "." : ` (resets ${window.resetsAt}).`}`,
+      );
+    }
   }
   return constraints;
 }
@@ -1033,11 +1059,23 @@ const make = Effect.gen(function* () {
    * Re-probe the requested instance once before refusing it.
    */
   const resolveTargetRechecking = (input: Parameters<typeof resolveTarget>[0]) => {
+    const namedProviders =
+      input.target?.providerName === undefined
+        ? []
+        : input.providers.filter(
+            (provider) =>
+              provider.displayName?.trim().toLowerCase() ===
+              input.target?.providerName?.trim().toLowerCase(),
+          );
     const instanceId =
       input.target?.providerInstanceId ??
-      (input.target?.driverKind === undefined
-        ? input.parent.thread.modelSelection.instanceId
-        : undefined);
+      (input.target?.providerName !== undefined
+        ? namedProviders.length === 1
+          ? namedProviders[0]?.instanceId
+          : undefined
+        : input.target?.driverKind === undefined
+          ? input.parent.thread.modelSelection.instanceId
+          : undefined);
     const resolved = resolveTarget(input);
     if (instanceId === undefined) return resolved;
     return resolved.pipe(
@@ -1059,19 +1097,86 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       const requestedInstanceId = input.target?.providerInstanceId;
       const requestedDriver = input.target?.driverKind;
+      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+      const inheritedSelection = input.parent.thread.modelSelection;
+      const inheritedProvider = input.providers.find(
+        (provider) => provider.instanceId === inheritedSelection.instanceId,
+      );
+      const implicitAccount =
+        requestedInstanceId === undefined && input.target?.providerName === undefined;
+      const automaticDriver = requestedDriver ?? inheritedProvider?.driver;
+      const intendedModel =
+        input.target?.model ??
+        (automaticDriver === inheritedProvider?.driver ? inheritedSelection.model : undefined);
+      const inheritedQuotaBlocked =
+        inheritedProvider !== undefined &&
+        exhaustedUsageWindows(inheritedProvider, intendedModel, nowMs).length > 0;
+      const automaticModel =
+        input.target?.model ??
+        (inheritedQuotaBlocked && automaticDriver === inheritedProvider?.driver
+          ? inheritedSelection.model
+          : undefined);
+      const availableForSelection = (provider: ServerProvider) =>
+        providerConstraints(provider, true, {
+          nowMs,
+          ...(automaticModel === undefined ? {} : { model: automaticModel }),
+        }).length === 0 &&
+        (automaticModel === undefined ||
+          provider.models.some((model) => model.slug === automaticModel)) &&
+        (!inheritedQuotaBlocked ||
+          automaticDriver !== inheritedProvider?.driver ||
+          invalidOptionSelections(
+            input.target?.options ?? inheritedSelection.options ?? [],
+            provider.models.find((model) => model.slug === automaticModel)?.capabilities
+              ?.optionDescriptors,
+          ).length === 0);
+      let quotaFailover = false;
       const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
       let instanceId = requestedInstanceId;
 
-      if (instanceId === undefined && requestedDriver !== undefined) {
+      if (input.target?.providerName !== undefined) {
+        const name = input.target.providerName;
+        const matches = input.providers.filter(
+          (provider) => provider.displayName?.trim().toLowerCase() === name.trim().toLowerCase(),
+        );
+        if (matches.length === 0) {
+          return yield* failure(
+            "provider_unavailable",
+            `No configured provider is named ${name}. Use orchestrator_capabilities to list providers.`,
+          );
+        }
+        if (matches.length > 1 && requestedInstanceId === undefined) {
+          return yield* failure(
+            "invalid_request",
+            `Provider name ${name} is ambiguous. Specify providerInstanceId: ${matches.map((provider) => provider.instanceId).join(", ")}.`,
+          );
+        }
+        if (
+          requestedInstanceId !== undefined &&
+          !matches.some((provider) => provider.instanceId === requestedInstanceId)
+        ) {
+          return yield* failure(
+            "invalid_request",
+            `Provider instance ${requestedInstanceId} does not match provider name ${name}.`,
+          );
+        }
+        instanceId ??= matches[0]?.instanceId;
+      }
+
+      if (
+        instanceId === undefined &&
+        (requestedDriver !== undefined || (implicitAccount && inheritedQuotaBlocked))
+      ) {
+        const selectedDriver = automaticDriver;
         const candidates = input.providers.filter(
           (provider) =>
-            provider.driver === requestedDriver &&
+            provider.driver === selectedDriver &&
             orchestrationCapableInstanceIds.has(provider.instanceId),
         );
         if (candidates.length === 0) {
           return yield* failure(
             "provider_unavailable",
-            `No V2 provider adapter is registered for driver ${requestedDriver}.`,
+            `No V2 provider adapter is registered for driver ${selectedDriver}.`,
           );
         }
         // Inherit the parent's instance only when it can actually serve the
@@ -1080,16 +1185,18 @@ const make = Effect.gen(function* () {
         const inheritedCandidate = candidates.find(
           (candidate) =>
             candidate.instanceId === input.parent.thread.modelSelection.instanceId &&
-            providerConstraints(candidate, true).length === 0,
+            availableForSelection(candidate),
         );
-        const availableCandidate = candidates.find(
-          (candidate) => providerConstraints(candidate, true).length === 0,
-        );
+        const availableCandidate = candidates.find(availableForSelection);
         instanceId = inheritedCandidate?.instanceId ?? availableCandidate?.instanceId;
+        quotaFailover =
+          inheritedQuotaBlocked &&
+          selectedDriver === inheritedProvider?.driver &&
+          instanceId !== inheritedSelection.instanceId;
         if (instanceId === undefined) {
           return yield* failure(
             "provider_unavailable",
-            `No available V2 provider instance for driver ${requestedDriver}.`,
+            `No available V2 provider instance for driver ${selectedDriver}${automaticModel === undefined ? "" : ` and model ${automaticModel}`}.`,
           );
         }
       }
@@ -1111,6 +1218,14 @@ const make = Effect.gen(function* () {
       const constraints = providerConstraints(
         provider,
         orchestrationCapableInstanceIds.has(provider.instanceId),
+        {
+          nowMs,
+          model:
+            input.target?.model ??
+            (quotaFailover || instanceId === inheritedSelection.instanceId
+              ? inheritedSelection.model
+              : provider.models[0]?.slug),
+        },
       );
       if (constraints.length > 0) {
         return yield* failure(
@@ -1119,11 +1234,10 @@ const make = Effect.gen(function* () {
         );
       }
 
-      const inheritedSelection = input.parent.thread.modelSelection;
       const requestedModel = input.target?.model;
       const model =
         requestedModel ??
-        (instanceId === inheritedSelection.instanceId
+        (instanceId === inheritedSelection.instanceId || quotaFailover
           ? inheritedSelection.model
           : provider?.models[0]?.slug);
       if (model === undefined) {
@@ -1144,7 +1258,8 @@ const make = Effect.gen(function* () {
         );
       }
 
-      const requestedOptions = input.target?.options;
+      const requestedOptions =
+        input.target?.options ?? (quotaFailover ? inheritedSelection.options : undefined);
       if (requestedOptions !== undefined) {
         const descriptors = provider.models.find((candidate) => candidate.slug === model)
           ?.capabilities?.optionDescriptors;
@@ -1676,6 +1791,7 @@ const make = Effect.gen(function* () {
         const { parent, limits } = yield* loadCaller(scope);
         const providers = yield* loadProviders;
         const orchestrationCapableInstanceIds = yield* loadOrchestrationCapableInstanceIds();
+        const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
         return {
           parentThreadId: parent?.thread.id ?? null,
           inheritedProviderInstanceId: parent?.thread.modelSelection.instanceId ?? null,
@@ -1686,6 +1802,7 @@ const make = Effect.gen(function* () {
             const constraints = providerConstraints(
               provider,
               orchestrationCapableInstanceIds.has(provider.instanceId),
+              { nowMs },
             );
             return {
               providerInstanceId: provider.instanceId,

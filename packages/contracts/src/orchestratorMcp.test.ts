@@ -84,6 +84,25 @@ describe("orchestrator MCP contracts", () => {
     ]);
   });
 
+  it("retains the configured provider name in delegated requests", () => {
+    const request = decodeDelegateTaskInput({
+      task: "Review the change.",
+      target: {
+        providerName: "Claude work",
+        model: "claude-opus-4-6",
+        options: { effort: "max", fastMode: true },
+      },
+    });
+    expect(request.target).toEqual({
+      providerName: "Claude work",
+      model: "claude-opus-4-6",
+      options: [
+        { id: "effort", value: "max" },
+        { id: "fastMode", value: true },
+      ],
+    });
+  });
+
   it("rejects target model options that are not strings or booleans", () => {
     expect(() =>
       decodeDelegateTaskInput({
