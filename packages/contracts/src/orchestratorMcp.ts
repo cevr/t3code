@@ -103,9 +103,16 @@ export const OrchestratorMcpTarget = Schema.Struct({
       description: "Configured provider instance id from orchestrator_capabilities.",
     }),
   ),
+  providerName: Schema.optional(
+    TrimmedNonEmptyString.annotate({
+      description:
+        "Configured provider display name from orchestrator_capabilities, matched case-insensitively. Must be unique; use providerInstanceId to disambiguate.",
+    }),
+  ),
   driverKind: Schema.optional(
     ProviderDriverKind.annotate({
-      description: "Provider driver kind; prefer providerInstanceId when available.",
+      description:
+        "Provider driver kind; prefer providerInstanceId or providerName to select an account.",
     }),
   ),
   model: Schema.optional(

@@ -154,10 +154,12 @@ function makeProviderSnapshot(input: {
   readonly driver: ProviderDriverKind;
   readonly model: string;
   readonly optionDescriptors?: ReadonlyArray<ProviderOptionDescriptor>;
+  readonly displayName?: string;
 }): ServerProvider {
   return {
     instanceId: input.instanceId,
     driver: input.driver,
+    ...(input.displayName === undefined ? {} : { displayName: input.displayName }),
     enabled: true,
     installed: true,
     version: "test",
@@ -636,6 +638,7 @@ describe("orchestrator MCP toolkit", () => {
               instanceId: claudeInstanceId,
               driver: ProviderDriverKind.make("claudeAgent"),
               model: claudeModel,
+              displayName: "Claude work",
             }),
             makeProviderSnapshot({
               instanceId: ProviderInstanceId.make("opencode"),
@@ -1678,7 +1681,7 @@ describe("orchestrator MCP toolkit", () => {
             const delegatedCall = yield* invoke("delegate_task", {
               task: delegatedPrompt,
               target: {
-                providerInstanceId: claudeInstanceId,
+                providerName: "Claude work",
                 model: claudeModel,
               },
               mode: "wait",
