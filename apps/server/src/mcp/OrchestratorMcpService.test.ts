@@ -1807,6 +1807,76 @@ describe("OrchestratorMcpService provider resolution", () => {
     );
   });
   it.effect(
+    "reports the child run's selection after a restart and the thread selection before launch",
+    () =>
+      Effect.gen(function* () {
+        const runSelection = {
+          instanceId: ProviderInstanceId.make("claudeAgent-personal"),
+          model: "claude-opus-4-6",
+          options: [
+            { id: "effort", value: "max" },
+            { id: "fastMode", value: true },
+          ],
+        } as const;
+        const threadSelection = {
+          instanceId: codexInstanceId,
+          model: "gpt-5.4",
+          options: [{ id: "reasoningEffort", value: "high" }],
+        } as const;
+        let hasRun = true;
+        const task = {
+          id: taskId,
+          threadId: parentThreadId,
+          origin: "app_owned",
+          childThreadId,
+          providerInstanceId: ProviderInstanceId.make("claudeAgent-work"),
+          model: "claude-sonnet-4-6",
+          status: "running",
+          result: null,
+        };
+        const dependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadRecords: (threadId) =>
+              Effect.succeed(
+                threadId === parentThreadId
+                  ? parentProjection([task])
+                  : ({
+                      ...childProjection,
+                      thread: { ...childProjection.thread, modelSelection: threadSelection },
+                      runs: hasRun
+                        ? [
+                            {
+                              id: RunId.make("run:mcp-restarted-child"),
+                              ordinal: 1,
+                              status: "running",
+                              modelSelection: runSelection,
+                            },
+                          ]
+                        : [],
+                    } as unknown as OrchestrationV2ThreadProjection),
+              ),
+          }),
+          providerRegistryLayer([]),
+          adapterRegistryLayer([]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          for (const selection of [runSelection, threadSelection]) {
+            const result = yield* service.taskStatus(scope, taskId);
+            assert.equal(result.providerInstanceId, selection.instanceId);
+            assert.equal(result.model, selection.model);
+            assert.deepEqual(result.options, selection.options);
+            hasRun = false;
+          }
+        }).pipe(Effect.provide(OrchestratorMcpService.layer.pipe(Layer.provide(dependencies))));
+      }),
+  );
+
+  it.effect(
     "preserves inherited fast service when overriding effort and allows clearing options",
     () =>
       Effect.gen(function* () {

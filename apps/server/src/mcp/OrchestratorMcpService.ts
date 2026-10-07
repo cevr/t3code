@@ -1292,6 +1292,11 @@ const make = Effect.gen(function* () {
             null);
       const resultTransfer = resultTransfers[0] ?? null;
       const terminalStatus = terminalRun === undefined ? null : taskStatusForRun(terminalRun);
+      const modelSelection = childRun?.modelSelection ??
+        childControls.thread.modelSelection ?? {
+          instanceId: task.providerInstanceId,
+          model: task.model,
+        };
       const response = {
         taskId: task.id,
         childThreadId: task.childThreadId,
@@ -1300,9 +1305,9 @@ const make = Effect.gen(function* () {
         status,
         workState,
         hasPendingChildRuns: hasPendingChildRuns(childProjection, childRun),
-        providerInstanceId: task.providerInstanceId,
-        model: task.model,
-        options: (childRun?.modelSelection ?? childControls.thread.modelSelection)?.options ?? [],
+        providerInstanceId: modelSelection.instanceId,
+        model: modelSelection.model,
+        options: modelSelection.options ?? [],
         summary: derivedResult,
         resultContextTransferId: resultTransfer?.id ?? null,
         latestTerminalRunId: terminalRun?.id ?? null,
